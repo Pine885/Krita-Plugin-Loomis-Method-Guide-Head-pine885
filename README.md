@@ -1,27 +1,28 @@
-# Loomis Method Head Guide for Krita (pinw fork)
+# Loomis Method Head Guide for Krita (pine885 fork)
 
 A Krita docker that draws an adjustable Loomis-method head construction guide as SVG vectors on a dedicated vector layer.
 
-Based on the original [Loomis Head Generator by lm0ss](https://github.com/lm0ss/loomis-head-krita). Forked by Nedeljko Umjetnik, then forked by pinw(me).
+Based on the original [Loomis Head Generator by lm0ss](https://github.com/lm0ss/loomis-head-krita). Forked by Nedeljko Umjetnik, then forked by pine885(me).
 
 ## Features
 
 - Proper Krita docker, registered in the plugin's `setup()` and available from **Settings -> Dockers**.
 - Compact, scrollable, resizable UI that can shrink to a narrow panel.
-- Multiple heads per document: create, duplicate, and delete heads, each on its own vector layer, including layers nested inside groups.
+- Multiple heads per document, each on its own vector layer, including layers nested inside groups. **New** creates a head; duplicate or delete head layers in Krita's Layers docker. Krita's **Duplicate Layer** (`Copy of <name>`) and layer copy/paste create independent heads.
 - The docker starts empty; **New** creates the first head.
-- A head is active only while its layer is the document's active layer. Selecting another layer clears the docker instance and disables editing and presets.
+- A head is active while its layer, or a mask on that layer, is the document's active node. Selecting another layer clears the docker instance and disables editing and presets.
 - Renaming or deleting a head layer in Krita updates or removes its docker instance.
 - Loomis head guides generated as vector shapes in the active document.
 - Trackball rotation, side cut, face length, face width, and stroke widths.
-- Size and position are set on the canvas with Krita's Transform or Move tools; the docker absorbs both changes.
+- To move, scale, or rotate a head, drag or scale its shapes with Select Shapes or the Transform tool (the change is absorbed into the model), or right-click the head layer → Add → Transform Mask and transform the mask.
 - Toggle silhouette, side rims, side cross, front arrow, and face guides.
 - Separate front/back stroke widths and a stroke color picker; the direction arrow uses the back-stroke style.
-- Moving or transforming the guide layer with Krita's tools is mirrored back into the head model.
+- Heads may keep the automatic `_HeadGuide_N` name or be renamed to a custom name; custom names survive save and reopen.
+- The **@** button at the top of the docker shows instructions and credits. When a head has a non-identity Transform Mask, live redraws wait longer so slider and trackball drags stall less.
+- The trackball reset button clears only the Transform Mask rotation, keeping its translation and scale. Use it when Krita's Transform tool reset does not restore the mask.
 - Selecting a head layer in Krita activates that head in the docker.
-- Save and load visual presets outside the `.kra` file. Only the **Front** built-in preset is included.
+- Save and load visual presets outside the `.kra` file. Only the **Default** built-in preset is included, and it is selected in the preset list when no other preset is assigned.
 - Each head's position, direction, and size are saved inside the document and restored when the document is reopened.
-- **Reset to defaults** restores the head's assigned preset (or the global defaults when it has none) without changing position, rotation, or size.
 
 ## Requirements
 
@@ -41,25 +42,37 @@ Krita 6 / PyQt6 is not supported.
 
 Enable **Settings -> Dockers -> Loomis Method Head Guide**.
 
-1. Select a head layer in Krita's Layers docker to make it active. The docker labels the active head; **New** adds a head, **Copy** duplicates it with an offset, and **Delete** removes it.
-2. Adjust the active head with the trackball and sliders. The document updates live.
-3. Move or scale the layer with Krita's Move or Transform tools. The docker mirrors the placement, then normalizes the guide after the gesture settles.
+1. Select a head layer in Krita's Layers docker to make it active. The docker labels the active head; **New** adds a head. Duplicate or delete head layers in Krita's Layers docker. Duplicating or copy/pasting a head layer creates an independent head; the docker renames the new layer to `_HeadGuide_N`.
+2. Adjust the active head with the trackball and sliders. The document updates live at the interval set in **Performance**.
+3. To move, scale, or rotate the head, either drag or scale its shapes with Select Shapes or the Transform tool (the change is absorbed into the model), or right-click the head layer → Add → Transform Mask and transform the mask. Use the **@** button for a quick reminder.
 
 Each head is a separate vector layer named `_HeadGuide_1`, `_HeadGuide_2`,
 and so on. Existing head layers are rediscovered when the document changes.
+Renaming a head to a custom name is allowed and is preserved across reloads.
 Legacy `Loomis Method Head Guide` layers are still recognized.
 
 > **Warning:** layers named `_HeadGuide_N` or `Loomis Method Head Guide [N]`
 > are managed by the plugin. Anything drawn directly on one of these layers is
 > erased the next time the guide is redrawn. Keep painting on a separate layer.
 
+## Performance
+
+The **Performance** group controls live redraws:
+
+- **Update** has a checkbox and an interval. Checked: live redraw at that interval. Unchecked: update only when a slider or the trackball is released, and the interval field is disabled. Heads with a non-identity Transform Mask never update faster than 300 ms.
+- **Samples** has a checkbox and a value. Checked: use that resolution while dragging. Unchecked: use full live resolution during the drag, and the value field is disabled. Releasing always redraws at full live resolution (128 samples by default).
+- Lower **Samples** values build the guide faster but look coarser during the drag.
+
+These values are saved outside the project file at
+`<AppDataLocation>/loomis_method_head_guide/settings.json` and apply to every document.
+
 ## Presets
 
-User presets store visual settings only. They do not store position, direction, or size, so one preset can be reused at different places, angles, and sizes. Only the **Front** built-in preset remains; it sets the head's direction to the front view.
+User presets store visual settings only. They do not store position, direction, or size, so one preset can be reused at different places, angles, and sizes. Only the **Default** built-in preset remains; it sets the head's direction to the front view. The preset list shows **Default**, not an empty entry, until another preset is assigned.
 
 Each head remembers the preset assigned to it, whether it has unsaved edits, and its full visual configuration inside the document. The current position, direction, and size are saved per layer as well, so reopening the `.kra` restores the head exactly. An edited preset is marked with ` *` in the preset list until it is saved or reloaded.
 
-**Reset to defaults** restores the assigned preset and clears the dirty marker. If the head has no preset, or its preset no longer exists, it falls back to the global defaults and clears the stale assignment. Position, rotation, and size are never reset.
+To restore the assigned preset's settings, select it and click **Load**. While the assigned preset has unsaved edits, this button reads **Reload**. Position, rotation, and size are never changed by loading a preset.
 
 - Select a preset and click **Load**.
 - Click **Save** to store the current settings under a new name.
@@ -107,8 +120,9 @@ Two diagnostic overrides are also available for A/B tests:
 LOOMIS_LIVE_SAMPLES=64 LOOMIS_REDRAW_MS=80 LOOMIS_TIMING=1 krita
 ```
 
-`LOOMIS_LIVE_SAMPLES` changes live curve resolution (16–1024, default 128).
-`LOOMIS_REDRAW_MS` changes the live redraw interval (0–1000 ms, default 40).
+`LOOMIS_LIVE_SAMPLES` changes the release/full curve resolution (16–1024, default 128).
+`LOOMIS_REDRAW_MS` sets the initial redraw timer before the saved **Performance** values load (0–1000 ms, default 40).
+`LOOMIS_TRANSFORMED_REDRAW_MS` sets the minimum interval for heads with a non-identity Transform Mask (0–2000 ms, default 300).
 Restart Krita after changing them.
 
 Tested with: Krita 5.3.4.1, Python 3.12.3
