@@ -1,4 +1,3 @@
-# trackball.py
 import math
 
 from PyQt5.QtCore import QRect, QRectF, Qt, pyqtSignal
@@ -11,7 +10,6 @@ from .linalg import (
     mat3_mul_vec,
     q_axis_angle,
     q_identity,
-    q_mul,
     q_normalize,
     q_to_mat3,
     q_to_yaw_pitch_roll,
@@ -87,7 +85,7 @@ class _ResetButton(QToolButton):
 
 
 class TrackballWidget(QWidget):
-    orientation_changed = pyqtSignal(object)  # emits Quaternion
+    orientation_changed = pyqtSignal(object)
     drag_started = pyqtSignal()
     drag_released = pyqtSignal()
 
@@ -95,15 +93,14 @@ class TrackballWidget(QWidget):
         super().__init__(parent)
         self.setMinimumSize(100, 100)
 
-        self.yaw = 0.0  # around world Y
-        self.pitch = 0.0  # around world X
-        self.roll = 0.0  # around view Z (via ring)
+        self.yaw = 0.0
+        self.pitch = 0.0
+        self.roll = 0.0
         self._q = q_identity()
 
-        # interaction state
         self._dragging = False
-        self._mode = None  # "turntable" | "roll"
-        self._theta0 = 0.0  # start angle for roll
+        self._mode = None
+        self._theta0 = 0.0
         self._roll0 = 0.0
 
         self.setMouseTracking(False)
@@ -123,7 +120,7 @@ class TrackballWidget(QWidget):
         cx, cy, r = self._center_radius()
         rx = max(r * 0.82, 1.0)
         x = (pos.x() - cx) / rx
-        y = (cy - pos.y()) / rx  # Y up
+        y = (cy - pos.y()) / rx
         d2 = x * x + y * y
         if d2 <= 1.0:
             z = math.sqrt(max(0.0, 1.0 - d2))
@@ -140,14 +137,14 @@ class TrackballWidget(QWidget):
     def _update_quaternion(self, emit=True):
         qy = q_axis_angle([0, 1, 0], self.yaw)
         qx = q_axis_angle([1, 0, 0], self.pitch)
-        q_turn = q_mul(qy, qx)
+        q_turn = qy * qx
 
         R_turn = q_to_mat3(q_turn)
         fwd_v = mat3_mul_vec(R_turn, Vector3(0.0, 0.0, 1.0))
         fwd = [fwd_v.x, fwd_v.y, fwd_v.z]
 
         q_roll = q_axis_angle(fwd, self.roll)
-        self._q = q_normalize(q_mul(q_roll, q_turn))
+        self._q = q_normalize(q_roll * q_turn)
 
         if emit:
             self.orientation_changed.emit(self._q)
@@ -162,7 +159,7 @@ class TrackballWidget(QWidget):
     def _angle_at(self, pos):
         cx, cy, _ = self._center_radius()
         x = pos.x() - cx
-        y = cy - pos.y()  # up
+        y = cy - pos.y()
         return math.atan2(y, x)
 
     def mousePressEvent(self, e):
@@ -200,8 +197,8 @@ class TrackballWidget(QWidget):
 
         if self._mode == "turntable":
             v = self._pos_to_forward_vec(e.pos())
-            self.yaw = math.atan2(float(v[0]), float(v[2]))  # right = +yaw
-            self.pitch = -math.asin(max(-1.0, min(1.0, float(v[1]))))  # up = +pitch
+            self.yaw = math.atan2(float(v[0]), float(v[2]))
+            self.pitch = -math.asin(max(-1.0, min(1.0, float(v[1]))))
             self._update_quaternion()
 
         elif self._mode == "roll":

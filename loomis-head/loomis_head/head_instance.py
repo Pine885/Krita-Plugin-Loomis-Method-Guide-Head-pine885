@@ -1,31 +1,21 @@
-"""Krita node lifecycle for one Loomis head instance.
-
-Heads are vector layers created at the document root. They are matched to
-tracked instances in ``loomis_head_plugin._reconcile_instances`` through
-``iter_vector_layers`` (which includes layers nested in groups) and
-``is_head_name``. Multiple heads can coexist in one document.
-"""
-
 import math
 import re
 import xml.etree.ElementTree as ET
 
-from . import limits, timing
-from .config import LIVE_SAMPLES
+from . import diag, limits, timing
+from .config import LIVE_SAMPLES, TRACE_TRANSFORM
+from .linalg import q_axis_angle
 from .loomis_head_generator import LoomisHead3D
 
 LAYER_PREFIX = "_HeadGuide"
 
 SCALE_TOLERANCE = 0.003
+ROTATION_TOLERANCE = math.radians(0.5)
+ROTATION_DISAGREEMENT = math.radians(1.0)
 NORMALIZE_SETTLE_POLLS = 3
 
 
 def scaled_placement(center, offset, scale, factor, minimum, maximum):
-    """Return (new_scale, new_position) after scaling about any pivot.
-
-    ``offset`` is the model position minus the geometry center at the last
-    redraw, so it grows with the geometry and keeps the head anchored.
-    """
     new_scale = max(minimum, min(maximum, scale * factor))
     effective = new_scale / scale if scale else 1.0
     position = (
@@ -33,6 +23,107 @@ def scaled_placement(center, offset, scale, factor, minimum, maximum):
         center[1] + effective * offset[1],
     )
     return new_scale, position
+
+
+def _wrap_angle(angle: float) -> float:
+    angle = math.fmod(angle + math.pi, 2.0 * math.pi)
+    if angle <= 0.0:
+        angle += 2.0 * math.pi
+    return angle - math.pi
+
+
+def _rotated_offset(offset, angle):
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    return (
+        offset[0] * cos_a - offset[1] * sin_a,
+        offset[0] * sin_a + offset[1] * cos_a,
+    )
+
+
+def _matrix_rotation(matrix):
+    if matrix is None:
+        return None
+    try:
+        m11 = float(matrix.m11())
+        m12 = float(matrix.m12())
+        m21 = float(matrix.m21())
+        m22 = float(matrix.m22())
+    except Exception:
+        return None
+    if not all(math.isfinite(value) for value in (m11, m12, m21, m22)):
+        return None
+    det = m11 * m22 - m12 * m21
+    if det <= 0.0:
+        return None
+    scale = math.sqrt(det)
+    if scale <= 1e-9:
+        return None
+    a, b = m11 / scale, m12 / scale
+    c, d = m21 / scale, m22 / scale
+    if abs(a - d) > 1e-3 or abs(b + c) > 1e-3:
+        return None
+    if abs(math.hypot(a, b) - 1.0) > 1e-3 or abs(math.hypot(c, d) - 1.0) > 1e-3:
+        return None
+    return math.atan2(b, a)
+
+
+def _parent_shape(shape):
+    getter = getattr(shape, "parentShape", None)
+    if getter is None:
+        return None
+    try:
+        return getter()
+    except Exception:
+        return None
+
+
+def _matrix_from(shape, name):
+    getter = getattr(shape, name, None)
+    if getter is None:
+        return None
+    try:
+        return getter()
+    except Exception:
+        return None
+
+
+def _placement_matrix(shape):
+    local = _matrix_from(shape, "transformation")
+    absolute = _matrix_from(shape, "absoluteTransformation")
+    if _parent_shape(shape) is not None:
+        return (local if local is not None else absolute), True
+
+    absolute_angle = _matrix_rotation(absolute)
+    if absolute_angle is not None and abs(absolute_angle) > ROTATION_TOLERANCE:
+        return absolute, False
+    if local is not None:
+        return local, True
+    return absolute, False
+
+
+def _shape_rotation(shape):
+    matrix, is_local = _placement_matrix(shape)
+    angle = _matrix_rotation(matrix)
+    if angle is None:
+        return None
+    if is_local and _parent_shape(shape) is None:
+        return -angle
+    return angle
+
+
+def _mean_rotation(angles):
+    if not angles:
+        return None
+    sin_sum = sum(math.sin(angle) for angle in angles)
+    cos_sum = sum(math.cos(angle) for angle in angles)
+    if abs(sin_sum) < 1e-12 and abs(cos_sum) < 1e-12:
+        return None
+    mean = math.atan2(sin_sum, cos_sum)
+    for angle in angles:
+        if abs(_wrap_angle(angle - mean)) > ROTATION_DISAGREEMENT:
+            return None
+    return mean
 
 _NAME_RE = re.compile(r"^_HeadGuide_(\d+)$")
 _LEGACY_RE = re.compile(r"^Loomis Method Head Guide(?: (\d+))?$")
@@ -45,11 +136,6 @@ _COPY_SUFFIX_RE = re.compile(
 
 
 def strip_copy_name(name: str) -> str | None:
-    """Return the source name of a duplicated layer, or None.
-
-    Krita uses both ``Copy of <name>`` and ``<name> copy`` depending on the
-    action. Several duplicates can stack, so strip repeatedly.
-    """
     text = (name or "").strip()
     changed = False
     while True:
@@ -70,12 +156,6 @@ def strip_copy_name(name: str) -> str | None:
 
 
 def head_base_name(name: str) -> str | None:
-    """Return the managed head name, ignoring a layer-duplicate prefix/suffix.
-
-    Krita appends suffixes such as ``copy``, ``copy 2`` or ``(copy)`` and uses
-    ``Copy of <name>`` for Duplicate Layer. Those layers still belong to the
-    plugin.
-    """
     name = name or ""
     if _NAME_RE.match(name) or _LEGACY_RE.match(name):
         return name
@@ -102,7 +182,6 @@ def _name_index(name: str) -> int:
 
 
 def owning_layer(node):
-    """Return the layer that owns a mask node, or the node itself."""
     try:
         if str(node.type()).endswith("mask"):
             return node.parentNode()
@@ -112,7 +191,6 @@ def owning_layer(node):
 
 
 def transform_masks(layer) -> list[object]:
-    """Return the transform masks attached to a head layer."""
     found = []
     try:
         children = layer.childNodes()
@@ -128,7 +206,6 @@ def transform_masks(layer) -> list[object]:
 
 
 def has_transformed_placement(instance) -> bool:
-    """True when the head has a non-identity transform mask."""
     for mask in transform_masks(instance.layer):
         try:
             transform = mask.finalAffineTransform()
@@ -165,7 +242,6 @@ def _zero_rotation(xml: str):
 
 
 def reset_transform_rotation(instance) -> bool:
-    """Clear rotation on the head's transform masks, keeping translation/scale."""
     changed = False
     for mask in transform_masks(instance.layer):
         try:
@@ -181,41 +257,34 @@ def reset_transform_rotation(instance) -> bool:
 
 
 def next_name(doc, reserved=()) -> str:
-    """Return the next free head layer name for a document."""
     highest = 0
     for node in iter_vector_layers(doc):
         try:
             name = node.name()
         except Exception:
             continue
-        highest = max(highest, _name_index(name))
+        if is_head_name(name):
+            highest = max(highest, _name_index(name))
     for name in reserved:
         highest = max(highest, _name_index(name))
     return "%s_%d" % (LAYER_PREFIX, highest + 1)
 
 
 def iter_vector_layers(doc) -> list[object]:
-    """Return every vector layer, including layers nested in groups."""
     try:
         root = doc.rootNode()
     except Exception:
         return []
-
-    try:
-        return list(root.findChildNodes("", True, False, "vectorlayer"))
-    except (AttributeError, TypeError, RuntimeError):
-        pass
 
     found: list[object] = []
 
     def walk(nodes):
         for node in nodes:
             try:
-                node_type = node.type()
+                if node.type() == "vectorlayer":
+                    found.append(node)
             except Exception:
                 continue
-            if node_type == "vectorlayer":
-                found.append(node)
             try:
                 children = node.childNodes()
             except Exception:
@@ -230,19 +299,6 @@ def iter_vector_layers(doc) -> list[object]:
     return found
 
 
-def discover(doc) -> list[tuple[str, object]]:
-    """Return (layer name, vector layer) for existing heads in the document."""
-    found: list[tuple[str, object]] = []
-    for layer in iter_vector_layers(doc):
-        try:
-            name = layer.name()
-        except Exception:
-            continue
-        if is_head_name(name):
-            found.append((name, layer))
-    return found
-
-
 class HeadInstance:
     def __init__(self, name, layer, model: LoomisHead3D, point_scale=(1.0, 1.0)):
         self.name = name
@@ -251,16 +307,16 @@ class HeadInstance:
         self.point_scale_x = float(point_scale[0])
         self.point_scale_y = float(point_scale[1])
         self.last_shape_states = self.shape_states()
-        self.last_bounds = self._layer_bounds()
+        self._refresh_gate()
         self.last_placement = None
         self.needs_normalize = False
         self.stable_polls = 0
+        self.rotation_applied = False
         self._refresh_placement_baseline()
         self.preset_name: str | None = None
         self.preset_dirty = False
 
     def _layer_bounds(self):
-        """Cheap layer-level bounds used to skip per-shape polling when idle."""
         try:
             box = self.layer.bounds()
         except Exception:
@@ -269,9 +325,38 @@ class HeadInstance:
             return None
         return (box.x(), box.y(), box.width(), box.height())
 
+    def _shape_signature(self):
+        try:
+            shapes = self.layer.shapes()
+        except Exception:
+            return None
+        for shape in shapes:
+            try:
+                if "arrow" in (shape.name() or "").lower():
+                    continue
+            except Exception:
+                continue
+            try:
+                point = shape.position()
+                matrix, _is_local = _placement_matrix(shape)
+                return (
+                    float(point.x()),
+                    float(point.y()),
+                    float(matrix.m11()),
+                    float(matrix.m12()),
+                    float(matrix.m21()),
+                    float(matrix.m22()),
+                )
+            except Exception:
+                return None
+        return None
+
+    def _refresh_gate(self):
+        self.last_bounds = self._layer_bounds()
+        self.last_signature = self._shape_signature()
+
     @staticmethod
     def _point_scale(doc):
-        """Pixels per document point; Krita shape coordinates are in points."""
         try:
             return (doc.xRes() / 72.0, doc.yRes() / 72.0)
         except (AttributeError, RuntimeError, TypeError):
@@ -303,18 +388,29 @@ class HeadInstance:
         instance._refresh_placement_baseline()
         return instance
 
-    def shape_states(self):
-        """Return (name, position, bounds center) for non-arrow shapes."""
-        states = []
+    def _head_shapes(self):
         try:
             shapes = self.layer.shapes()
         except Exception:
-            return states
+            return None
+        found = []
         for shape in shapes:
             try:
                 name = shape.name()
-                if "arrow" in (name or "").lower():
-                    continue
+            except Exception:
+                continue
+            if "arrow" in (name or "").lower():
+                continue
+            found.append((shape, name))
+        return found
+
+    def shape_states(self):
+        shapes = self._head_shapes()
+        if shapes is None:
+            return []
+        states = []
+        for shape, name in shapes:
+            try:
                 point = shape.position()
                 box = shape.boundingBox()
                 center = None
@@ -329,11 +425,18 @@ class HeadInstance:
         return states
 
     def placement_delta(self):
-        """Return ((dx, dy), scale factor, current states, bounds changed)."""
         bounds = self._layer_bounds()
-        if bounds is not None and bounds == self.last_bounds:
+        signature = self._shape_signature()
+        if (
+            bounds is not None
+            and bounds == self.last_bounds
+            and signature == self.last_signature
+        ):
             return None, None, self.last_shape_states, False
         self.last_bounds = bounds
+        self.last_signature = signature
+        if TRACE_TRANSFORM:
+            self._trace_shapes()
 
         current = self.shape_states()
         previous = self.last_shape_states
@@ -359,55 +462,34 @@ class HeadInstance:
         return (dx, dy), self.scale_factor(), current, True
 
     def bounds_center(self):
-        """Center of the head geometry, ignoring the detached arrow marker."""
-        boxes = []
-        try:
-            for shape in self.layer.shapes():
-                try:
-                    if "arrow" in (shape.name() or "").lower():
-                        continue
-                    box = shape.boundingBox()
-                except Exception:
-                    continue
-                if box is None or box.isNull() or box.isEmpty():
-                    continue
-                boxes.append(box)
-        except Exception:
+        boxes, _, _ = self._shape_boxes()
+        if boxes is None:
             return None
+        if boxes:
+            left = min(box[0] for box in boxes)
+            top = min(box[1] for box in boxes)
+            right = max(box[0] + box[2] for box in boxes)
+            bottom = max(box[1] + box[3] for box in boxes)
+            return ((left + right) / 2.0, (top + bottom) / 2.0)
 
-        if not boxes:
-            try:
-                bounds = self.layer.bounds()
-                if bounds is None or bounds.isNull() or bounds.isEmpty():
-                    return None
-                return (
-                    (bounds.x() + bounds.width() / 2.0) / self.point_scale_x,
-                    (bounds.y() + bounds.height() / 2.0) / self.point_scale_y,
-                )
-            except (AttributeError, RuntimeError, TypeError):
-                return None
+        bounds = self._layer_bounds()
+        if bounds is None:
+            return None
+        x, y, width, height = bounds
+        return (
+            (x + width / 2.0) / self.point_scale_x,
+            (y + height / 2.0) / self.point_scale_y,
+        )
 
-        left = min(box.x() for box in boxes)
-        top = min(box.y() for box in boxes)
-        right = max(box.x() + box.width() for box in boxes)
-        bottom = max(box.y() + box.height() for box in boxes)
-        return ((left + right) / 2.0, (top + bottom) / 2.0)
-
-    def placement_metrics(self):
-        """Return geometry center (pixels), extent (points), and scale factor."""
+    def _shape_boxes(self):
+        shapes = self._head_shapes()
+        if shapes is None:
+            return None, [], []
         boxes = []
         factors = []
-        try:
-            shapes = self.layer.shapes()
-        except Exception:
-            return None
-
-        for shape in shapes:
-            try:
-                if "arrow" in (shape.name() or "").lower():
-                    continue
-            except Exception:
-                continue
+        rotations = []
+        rotations_ok = True
+        for shape, _name in shapes:
             try:
                 box = shape.boundingBox()
             except Exception:
@@ -419,9 +501,105 @@ class HeadInstance:
                 matrix = getter() if getter is not None else shape.transformation()
                 det = matrix.m11() * matrix.m22() - matrix.m12() * matrix.m21()
             except Exception:
-                continue
+                det = 0.0
             if det > 0.0 and math.isfinite(det):
                 factors.append(math.sqrt(det))
+            if rotations_ok:
+                angle = _shape_rotation(shape)
+                if angle is None:
+                    rotations_ok = False
+                else:
+                    rotations.append(angle)
+        if not rotations_ok:
+            rotations = []
+        return boxes, factors, rotations
+
+    @staticmethod
+    def _matrix_text(matrix):
+        if matrix is None:
+            return "none"
+        try:
+            return "m11=%g m12=%g m21=%g m22=%g" % (
+                matrix.m11(),
+                matrix.m12(),
+                matrix.m21(),
+                matrix.m22(),
+            )
+        except Exception:
+            return "error"
+
+    @staticmethod
+    def _shape_matrix_text(shape, attribute):
+        getter = getattr(shape, attribute, None)
+        if getter is None:
+            return "none"
+        try:
+            return HeadInstance._matrix_text(getter())
+        except Exception:
+            return "error"
+
+    def _trace_shapes(self):
+        for shape, name in self._head_shapes() or []:
+            try:
+                point = shape.position()
+                position = "(%g,%g)" % (point.x(), point.y())
+            except Exception:
+                position = "?"
+            try:
+                box = shape.boundingBox()
+                bounding = "(%g,%g,%g,%g)" % (
+                    box.x(),
+                    box.y(),
+                    box.width(),
+                    box.height(),
+                )
+            except Exception:
+                bounding = "?"
+            try:
+                parent = type(shape.parentShape()).__name__
+            except Exception:
+                parent = "?"
+            diag.warn(
+                "transform shape=%r pos=%s box=%s local[%s] absolute[%s] parent=%s"
+                % (
+                    name,
+                    position,
+                    bounding,
+                    self._shape_matrix_text(shape, "transformation"),
+                    self._shape_matrix_text(shape, "absoluteTransformation"),
+                    parent,
+                )
+            )
+
+    def _trace_decision(self, changed, angle, factor, delta):
+        _boxes, _factors, rotations = self._shape_boxes()
+        baseline = None
+        if self.last_placement is not None:
+            baseline = self.last_placement.get("rotation")
+        if not changed:
+            decision = "skip (unchanged)"
+        elif angle is not None:
+            decision = "rotate"
+        elif factor is not None:
+            decision = "scale"
+        elif delta is not None:
+            decision = "move"
+        else:
+            decision = "none"
+        diag.warn(
+            "transform rotations=%r baseline_rotation=%r rotation_delta=%r decision=%s"
+            % (
+                [round(value, 6) for value in rotations],
+                baseline,
+                angle,
+                decision,
+            )
+        )
+
+    def placement_metrics(self):
+        boxes, factors, rotations = self._shape_boxes()
+        if boxes is None:
+            return None
 
         transform = None
         if factors:
@@ -437,31 +615,48 @@ class HeadInstance:
                 (top + bottom) / 2.0 * self.point_scale_y,
             )
             extent = (right - left, bottom - top)
-            return {"center": center, "extent": extent, "transform": transform}
+            return {
+                "center": center,
+                "extent": extent,
+                "transform": transform,
+                "rotation": _mean_rotation(rotations),
+            }
 
-        try:
-            bounds = self.layer.bounds()
-        except Exception:
+        bounds = self._layer_bounds()
+        if bounds is None:
             return None
-        if bounds is None or bounds.isNull() or bounds.isEmpty():
-            return None
+        x, y, width, height = bounds
         return {
-            "center": (bounds.x() + bounds.width() / 2.0, bounds.y() + bounds.height() / 2.0),
-            "extent": (bounds.width(), bounds.height()),
+            "center": (x + width / 2.0, y + height / 2.0),
+            "extent": (width, height),
             "transform": transform,
+            "rotation": _mean_rotation(rotations),
         }
 
-    def _refresh_placement_baseline(self):
+    def _refresh_placement_baseline(self, keep_rotation=False):
+        previous = None
+        if self.last_placement is not None:
+            previous = self.last_placement.get("rotation")
         metrics = self.placement_metrics()
         if metrics is not None:
             metrics["offset"] = (
                 self.model.position_x - metrics["center"][0],
                 self.model.position_y - metrics["center"][1],
             )
+            if keep_rotation and self.last_placement is not None:
+                metrics["rotation"] = self.last_placement.get("rotation")
         self.last_placement = metrics
+        if TRACE_TRANSFORM:
+            diag.warn(
+                "transform baseline keep_rotation=%s rotation %r -> %r"
+                % (
+                    keep_rotation,
+                    previous,
+                    None if metrics is None else metrics.get("rotation"),
+                )
+            )
 
     def scale_factor(self):
-        """Return the uniform scale ratio since the last redraw, or None."""
         baseline = self.last_placement
         current = self.placement_metrics()
         if baseline is None or current is None:
@@ -485,8 +680,7 @@ class HeadInstance:
             return None
         return factor
 
-    def apply_scale_factor(self, factor) -> bool:
-        """Absorb a canvas scale gesture into the model without redrawing."""
+    def apply_scale_factor(self, factor, keep_rotation=False) -> bool:
         baseline = self.last_placement
         current = self.placement_metrics()
         if baseline is None or current is None or factor is None:
@@ -502,10 +696,81 @@ class HeadInstance:
         self.model.set_scale(scale)
         self.model.set_position_x(position[0])
         self.model.set_position_y(position[1])
+        self._refresh_placement_baseline(keep_rotation=keep_rotation)
+        self.last_shape_states = self.shape_states()
+        self._refresh_gate()
+        return True
+
+    def rotation_delta(self):
+        baseline = self.last_placement
+        current = self.placement_metrics()
+        if baseline is None or current is None:
+            return None
+        before = baseline.get("rotation")
+        after = current.get("rotation")
+        if before is None or after is None:
+            return None
+        delta = _wrap_angle(after - before)
+        if abs(delta) < ROTATION_TOLERANCE:
+            return None
+        return delta
+
+    def apply_rotation_delta(self, angle, factor=None) -> bool:
+        baseline = self.last_placement
+        current = self.placement_metrics()
+        if baseline is None or current is None:
+            return False
+        scale = self.model.scale
+        effective = 1.0
+        if factor is not None:
+            scale = max(
+                limits.SCALE.minimum,
+                min(limits.SCALE.maximum, self.model.scale * factor),
+            )
+            effective = scale / self.model.scale if self.model.scale else 1.0
+        offset = _rotated_offset(baseline.get("offset", (0.0, 0.0)), angle)
+        position = (
+            current["center"][0] + effective * offset[0],
+            current["center"][1] + effective * offset[1],
+        )
+        self.model.set_scale(scale)
+        self.model.set_position_x(position[0])
+        self.model.set_position_y(position[1])
+        self.model.set_quaternion(
+            q_axis_angle((0.0, 0.0, 1.0), -angle) * self.model.q
+        )
         self._refresh_placement_baseline()
         self.last_shape_states = self.shape_states()
-        self.last_bounds = self._layer_bounds()
+        self._refresh_gate()
+        self.rotation_applied = True
         return True
+
+    def take_rotation_applied(self) -> bool:
+        applied = self.rotation_applied
+        self.rotation_applied = False
+        return applied
+
+    def adopt_placement(self):
+        delta, factor, current, changed = self.placement_delta()
+        self.last_shape_states = current
+        angle = self.rotation_delta() if changed else None
+        if TRACE_TRANSFORM and changed:
+            self._trace_decision(changed, angle, factor, delta)
+        if angle is not None:
+            self.apply_rotation_delta(angle, factor)
+            if factor is not None:
+                self.needs_normalize = True
+            return True, changed
+        if factor is not None:
+            self.apply_scale_factor(factor, keep_rotation=True)
+            self.needs_normalize = True
+            return True, changed
+        if delta is not None:
+            self.model.set_position_x(self.model.position_x + delta[0])
+            self.model.set_position_y(self.model.position_y + delta[1])
+            self._refresh_placement_baseline(keep_rotation=True)
+            return True, changed
+        return False, changed
 
     def _selected_shape_names(self):
         names = []
@@ -534,8 +799,45 @@ class HeadInstance:
         except Exception:
             pass
 
+    def _clear_shape_rotation(self):
+        try:
+            shapes = self.layer.shapes()
+        except Exception:
+            return
+        cleared = 0
+        for shape in shapes:
+            try:
+                matrix = shape.transformation()
+                angle = _matrix_rotation(matrix)
+                if angle is None or abs(angle) < ROTATION_TOLERANCE:
+                    continue
+                m11 = matrix.m11()
+                m12 = matrix.m12()
+                m21 = matrix.m21()
+                m22 = matrix.m22()
+                det = m11 * m22 - m12 * m21
+                if det <= 0.0 or not math.isfinite(det):
+                    continue
+                scale = math.sqrt(det)
+                matrix.setMatrix(
+                    scale,
+                    0.0,
+                    0.0,
+                    scale,
+                    matrix.dx(),
+                    matrix.dy(),
+                )
+                shape.setTransformation(matrix)
+                cleared += 1
+            except Exception:
+                continue
+        if TRACE_TRANSFORM and cleared:
+            diag.warn("transform redraw cleared_rotation_shapes=%d" % cleared)
+
     def redraw(self, doc, samples: int = LIVE_SAMPLES) -> dict:
         started = timing.now()
+        if TRACE_TRANSFORM:
+            diag.warn("transform redraw begin")
         svg = self.model.build_svg(
             width=doc.width(),
             height=doc.height(),
@@ -556,7 +858,10 @@ class HeadInstance:
 
         self.layer.addShapesFromSvg(svg)
         self._restore_shape_selection(selected)
+        self._clear_shape_rotation()
         added = timing.now()
+        if TRACE_TRANSFORM:
+            diag.warn("transform redraw shapes_added")
 
         self.last_shape_states = self.shape_states()
         self._refresh_placement_baseline()
@@ -564,7 +869,7 @@ class HeadInstance:
         self.stable_polls = 0
         states_read = timing.now()
 
-        self.last_bounds = self._layer_bounds()
+        self._refresh_gate()
         finished = timing.now()
 
         return {
@@ -584,11 +889,5 @@ class HeadInstance:
         try:
             self.layer.setVisible(True)
             doc.setActiveNode(self.layer)
-        except Exception:
-            pass
-
-    def remove(self) -> None:
-        try:
-            self.layer.remove()
         except Exception:
             pass

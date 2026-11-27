@@ -1,17 +1,3 @@
-"""Opt-in timing for Krita-side redraw calls.
-
-Krita's Python API gives no profiler. Enable this to see which part of a live
-redraw actually costs time:
-
-    LOOMIS_TIMING=1 krita
-
-Append to a file instead of stderr:
-
-    LOOMIS_TIMING=1 LOOMIS_TIMING_LOG=/tmp/loomis-timing.log krita
-
-Timing is disabled by default and adds only timestamp calls when off.
-"""
-
 import os
 import sys
 import time
@@ -45,7 +31,6 @@ def emit(message: str) -> None:
     sys.stderr.flush()
 
 def format_redraw(data: dict) -> str:
-    """Format the dict returned by HeadInstance.redraw()."""
     remove_ms = "[%s]" % ",".join(
         "%.2f" % milliseconds(value) for value in data.get("remove_each", ())
     )

@@ -1,11 +1,3 @@
-"""Per-document head placement stored in a Krita document annotation.
-
-Presets are global visual configuration. Each head instance's position,
-direction, and size belong to the document, keyed by the layer's persistent
-unique id. This module stays free of Krita and PyQt imports so it can be unit
-tested.
-"""
-
 import copy
 import json
 import math
@@ -40,8 +32,34 @@ def _quaternion(value):
     return result
 
 
+def _clean_entry(raw) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    item = {}
+    name = raw.get("name")
+    if isinstance(name, str) and name:
+        item["name"] = name
+    position = _vector(raw.get("position"), 2)
+    if position is not None:
+        item["position"] = position
+    quaternion = _quaternion(raw.get("quaternion"))
+    if quaternion is not None:
+        item["quaternion"] = quaternion
+    scale = raw.get("scale")
+    if _finite(scale) and scale > 0.0:
+        item["scale"] = float(scale)
+    config = raw.get("config")
+    if isinstance(config, dict):
+        item["config"] = copy.deepcopy(config)
+    preset = raw.get("preset")
+    if isinstance(preset, str) and preset:
+        item["preset"] = preset
+    if raw.get("preset_dirty") is True:
+        item["preset_dirty"] = True
+    return item
+
+
 def loads(payload) -> dict:
-    """Parse annotation bytes/text, returning an empty state on any damage."""
     if not isinstance(payload, (bytes, bytearray, str)):
         data_method = getattr(payload, "data", None)
         if callable(data_method):
@@ -70,29 +88,9 @@ def loads(payload) -> dict:
 
     instances = {}
     for key, entry in raw.items():
-        if not isinstance(key, str) or not isinstance(entry, dict):
+        if not isinstance(key, str):
             continue
-        item = {}
-        name = entry.get("name")
-        if isinstance(name, str) and name:
-            item["name"] = name
-        position = _vector(entry.get("position"), 2)
-        if position is not None:
-            item["position"] = position
-        quaternion = _quaternion(entry.get("quaternion"))
-        if quaternion is not None:
-            item["quaternion"] = quaternion
-        scale = entry.get("scale")
-        if _finite(scale) and scale > 0.0:
-            item["scale"] = float(scale)
-        config = entry.get("config")
-        if isinstance(config, dict):
-            item["config"] = copy.deepcopy(config)
-        preset = entry.get("preset")
-        if isinstance(preset, str) and preset:
-            item["preset"] = preset
-        if entry.get("preset_dirty") is True:
-            item["preset_dirty"] = True
+        item = _clean_entry(entry)
         if item:
             instances[key] = item
 
@@ -104,7 +102,6 @@ def dumps(state: dict) -> str:
 
 
 def lookup(state: dict, uid: str, name: str | None = None) -> dict | None:
-    """Find an entry by layer id, falling back to the layer name."""
     instances = state.get("instances", {}) if isinstance(state, dict) else {}
     entry = instances.get(uid)
     if isinstance(entry, dict):
@@ -127,24 +124,19 @@ def remember(
     preset_dirty: bool = False,
     scale=None,
 ) -> bool:
-    """Store one instance placement/config/preset; return True when changed."""
     instances = state.setdefault("instances", {})
-    new = {"name": name}
-
-    position = _vector(position, 2)
-    if position is not None:
-        new["position"] = position
-    quaternion = _quaternion(quaternion)
-    if quaternion is not None:
-        new["quaternion"] = quaternion
-    if _finite(scale) and scale > 0.0:
-        new["scale"] = float(scale)
-    if isinstance(config, dict):
-        new["config"] = copy.deepcopy(config)
-    if isinstance(preset, str) and preset:
-        new["preset"] = preset
-    if preset_dirty:
-        new["preset_dirty"] = True
+    new = _clean_entry(
+        {
+            "name": name,
+            "position": position,
+            "quaternion": quaternion,
+            "scale": scale,
+            "config": config,
+            "preset": preset,
+            "preset_dirty": preset_dirty,
+        }
+    )
+    new["name"] = name
 
     if uid not in instances and name:
         for key, entry in list(instances.items()):

@@ -1,12 +1,6 @@
-"""Persistent live-redraw performance settings.
-
-Kept free of Krita and PyQt imports so the docker can load and save the same
-values the test suite validates with plain Python.
-"""
-
-import json
 import os
-import tempfile
+
+from . import jsonio
 
 SCHEMA_VERSION = 2
 
@@ -58,7 +52,6 @@ def normalize(values) -> dict:
     if "live_update" in values:
         data["live_update"] = bool(values["live_update"])
     else:
-        # Older files used update_ms=0 to mean "update on release".
         data["live_update"] = not release_mode
     if release_mode:
         update_ms = data["update_ms"]
@@ -71,22 +64,18 @@ def normalize(values) -> dict:
 
 
 class PerfSettingsStore:
-    """JSON-backed performance settings with atomic writes."""
 
     def __init__(self, directory: str) -> None:
         self.directory = directory
         self.path = os.path.join(directory, "settings.json")
 
     def load(self) -> dict:
-        try:
-            with open(self.path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-        except (OSError, ValueError):
+        data = jsonio.read_json(self.path)
+        if data is None:
             return defaults()
         return normalize(data)
 
     def save(self, update_ms, live_update, reduce_live, live_samples) -> None:
-        os.makedirs(self.directory, exist_ok=True)
         payload = {
             "version": SCHEMA_VERSION,
             "update_ms": clamp_update_ms(update_ms),
@@ -94,14 +83,4 @@ class PerfSettingsStore:
             "reduce_live": bool(reduce_live),
             "live_samples": clamp_live_samples(live_samples),
         }
-        fd, temp_path = tempfile.mkstemp(
-            prefix=".settings-", suffix=".json", dir=self.directory
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2, sort_keys=True)
-                handle.write("\n")
-            os.replace(temp_path, self.path)
-        finally:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
+        jsonio.write_json(self.path, payload)

@@ -2,7 +2,7 @@ import os
 
 from krita import DockWidget, DockWidgetFactory, DockWidgetFactoryBase, Extension, Krita
 from PyQt5 import uic
-from PyQt5.QtCore import QByteArray, QStandardPaths, Qt, QTimer
+from PyQt5.QtCore import QStandardPaths, Qt, QTimer
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QColorDialog,
@@ -14,25 +14,21 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from . import diag, limits, local_state, timing
+from . import diag, timing
 from .config import (
     LIVE_SAMPLES,
-    LOCAL_SAVE_DEBOUNCE,
     RECONCILE_INTERVAL,
     REDRAW_DEBOUNCE,
     SYNC_INTERVAL,
     TRANSFORMED_REDRAW_DEBOUNCE,
 )
+from .document_registry import DocumentRegistry, node_key
 from .head_instance import (
     NORMALIZE_SETTLE_POLLS,
     HeadInstance,
     has_transformed_placement,
-    head_base_name,
-    iter_vector_layers,
-    next_name,
     owning_layer,
     reset_transform_rotation,
-    strip_copy_name,
 )
 from .linalg import q_identity
 from .loomis_head_generator import LoomisHead3D
@@ -40,70 +36,35 @@ from .perf_settings import PerfSettingsStore
 from .presets import (
     PresetStore,
     builtin_names,
-    canonical_name,
     clean_name,
     load_button_label,
     preset_label,
 )
 from .trackball import TrackballWidget
+from .ui_specs import EDITING_WIDGETS, SLIDERS, TOGGLES
 
 PRESET_FOLDER = "loomis_method_head_guide"
-
-
-def _doc_key(doc) -> str:
-    try:
-        return str(doc.rootNode().uniqueId())
-    except Exception:
-        return str(id(doc))
-
-
-def _node_key(node) -> str:
-    try:
-        return str(node.uniqueId())
-    except Exception:
-        return str(id(node))
-
-
-def _default_model() -> LoomisHead3D:
-    return LoomisHead3D()
-
-
-class DocumentState:
-    def __init__(self, doc):
-        self.doc = doc
-        self.instances: dict[str, HeadInstance] = {}
-        self.active_id: str | None = None
-        self.local = local_state.empty_state()
-
-    def active(self) -> HeadInstance | None:
-        if self.active_id is None:
-            return None
-        return self.instances.get(self.active_id)
 
 
 class LoomisProportionsDocker(DockWidget):
     def __init__(self):
         super().__init__()
 
-        self.doc = None
-        self.state = None
-        self.states: dict[str, DocumentState] = {}
-        self._fallback_model = _default_model()
+        self._fallback_model = LoomisHead3D()
         self.update_scheduled = False
         self._drawing = False
-        self.local_dirty = False
         self._last_sync = 0.0
         self._interacting = False
+
+        self.registry = DocumentRegistry(
+            on_changed=self._on_document_changed,
+            before_change=self.flush_pending_draw,
+        )
 
         self.draw_timer = QTimer(self)
         self.draw_timer.setSingleShot(True)
         self.draw_timer.setInterval(REDRAW_DEBOUNCE)
         self.draw_timer.timeout.connect(self._draw_pending)
-
-        self.local_save_timer = QTimer(self)
-        self.local_save_timer.setSingleShot(True)
-        self.local_save_timer.setInterval(LOCAL_SAVE_DEBOUNCE)
-        self.local_save_timer.timeout.connect(self._write_local_state)
 
         self.setWindowTitle("Loomis Method Head Guide")
         self.setMinimumSize(200, 160)
@@ -115,39 +76,41 @@ class LoomisProportionsDocker(DockWidget):
         self.perf_store = PerfSettingsStore(os.path.join(app_data, PRESET_FOLDER))
 
         self.connect_ui()
-        self.refresh_preset_combo()
+        self._sync_preset_selection(rebuild=True)
 
-        # Poll the active layer so clicking a head layer (or its transform
-        # mask) activates that head in the docker.
         self.active_sync_timer = QTimer(self)
         self.active_sync_timer.setInterval(120)
         self.active_sync_timer.timeout.connect(self._poll_active_layer)
         self.active_sync_timer.start()
 
-        # Full layer-tree scans are comparatively expensive; run them slowly
-        # and keep the 120 ms path limited to the active layer.
         self.reconcile_timer = QTimer(self)
         self.reconcile_timer.setInterval(RECONCILE_INTERVAL)
-        self.reconcile_timer.timeout.connect(self._reconcile_instances)
+        self.reconcile_timer.timeout.connect(self.registry.reconcile)
         self.reconcile_timer.start()
 
         try:
-            Krita.instance().notifier().applicationClosing.connect(self._flush_local_state)
+            Krita.instance().notifier().applicationClosing.connect(
+                self.registry.flush_local_state
+            )
         except Exception:
             pass
 
-        self._attach_document(Krita.instance().activeDocument())
+        self.registry.attach(Krita.instance().activeDocument())
 
-    # --- active model / node -------------------------------------------
 
-    def active_state(self) -> DocumentState | None:
-        if self.doc is None:
-            return None
-        return self.state
+    @property
+    def doc(self):
+        return self.registry.doc
 
-    def active_instance(self) -> HeadInstance | None:
-        state = self.active_state()
-        return state.active() if state is not None else None
+    @property
+    def state(self):
+        return self.registry.state
+
+    def active_state(self):
+        return self.registry.active_state()
+
+    def active_instance(self):
+        return self.registry.active_instance()
 
     @property
     def loomis_head(self) -> LoomisHead3D:
@@ -159,17 +122,21 @@ class LoomisProportionsDocker(DockWidget):
         instance = self.active_instance()
         return instance.layer if instance is not None else None
 
-    # --- document / instance bookkeeping --------------------------------
+
+    def _on_document_changed(self):
+        self.refresh_instance_header()
+        self.sync_ui_from_model()
 
     def showEvent(self, event):
         super().showEvent(event)
-        self._attach_document(Krita.instance().activeDocument())
+        self._last_sync = 0.0
+        self.registry.attach(Krita.instance().activeDocument())
         self.active_sync_timer.start()
         self.reconcile_timer.start()
 
     def hideEvent(self, event):
         self.flush_pending_draw()
-        self._flush_local_state()
+        self.registry.flush_local_state()
         self.active_sync_timer.stop()
         self.reconcile_timer.stop()
         super().hideEvent(event)
@@ -180,277 +147,10 @@ class LoomisProportionsDocker(DockWidget):
         else:
             doc = Krita.instance().activeDocument()
 
-        self._attach_document(doc)
-
-    def _attach_document(self, doc):
-        if doc is None:
-            if self.doc is not None:
-                self.flush_pending_draw()
-                self._flush_local_state()
-            self.doc = None
-            self.state = None
-            self.refresh_instance_header()
-            self.sync_ui_from_model()
-            return
-
-        key = _doc_key(doc)
-        old_key = _doc_key(self.doc) if self.doc is not None else None
-        doc_changed = key != old_key
-        if doc_changed:
-            self.flush_pending_draw()
-            self._flush_local_state()
-
-        state = self.states.get(key)
-        if state is None:
-            state = DocumentState(doc)
-            state.local = self._read_local_state(doc)
-            self.states[key] = state
-        elif doc_changed:
-            state.local = self._read_local_state(doc)
-            state.instances.clear()
-            state.active_id = None
-        elif not state.local.get("instances"):
-            state.local = self._read_local_state(doc)
-        state.doc = doc
-        self.doc = doc
-        self.state = state
         self._last_sync = 0.0
-
-        self._reconcile_instances()
-        self.refresh_instance_header()
-        self.sync_ui_from_model()
-
-    def _read_local_state(self, doc):
-        try:
-            payload = doc.annotation(local_state.ANNOTATION_TYPE)
-        except Exception as exc:
-            diag.warn("could not read local state: %s" % exc)
-            return local_state.empty_state()
-        if not payload:
-            return local_state.empty_state()
-        return local_state.loads(payload)
-
-    def _write_local_state(self):
-        self.local_save_timer.stop()
-        state = self.active_state()
-        if not self.local_dirty or state is None or self.doc is None:
-            return
-        payload = local_state.dumps(state.local).encode("utf-8")
-        try:
-            self.doc.setAnnotation(
-                local_state.ANNOTATION_TYPE,
-                local_state.ANNOTATION_DESCRIPTION,
-                QByteArray(payload),
-            )
-        except Exception as exc:
-            diag.warn("could not write local state: %s" % exc)
-            return
-        self.local_dirty = False
-
-    def _flush_local_state(self):
-        self.local_save_timer.stop()
-        if self.local_dirty:
-            self._write_local_state()
-
-    def _schedule_local_save(self):
-        self.local_dirty = True
-        self.local_save_timer.start()
-
-    def _remember_instance(self, instance=None):
-        state = self.active_state()
-        if instance is None and state is not None:
-            instance = state.active()
-        if state is None or instance is None:
-            return False
-        placement = instance.model.to_local_dict()
-        changed = local_state.remember(
-            state.local,
-            _node_key(instance.layer),
-            instance.name,
-            placement["position"],
-            placement["quaternion"],
-            config=instance.model.to_config_dict(),
-            preset=instance.preset_name,
-            preset_dirty=instance.preset_dirty,
-            scale=placement["scale"],
-        )
-        if changed:
-            self._schedule_local_save()
-        return changed
-
-    @staticmethod
-    def _head_source_instance(state, base_name):
-        """Find the head a duplicated layer was copied from."""
-        if not base_name:
-            return None
-        for instance in state.instances.values():
-            try:
-                if instance.layer.name() == base_name:
-                    return instance
-            except Exception:
-                continue
-        for instance in state.instances.values():
-            if instance.name == base_name:
-                return instance
-        return None
-
-    @staticmethod
-    def _known_local_head(state, key):
-        """True when the document annotation already tracks this layer."""
-        if not isinstance(state.local, dict):
-            return False
-        instances = state.local.get("instances")
-        return isinstance(instances, dict) and key in instances
-
-    def _reconcile_instances(self):
-        """Match tracked instances against the document's current layers."""
-        state = self.active_state()
-        if state is None or self.doc is None:
-            return
-
-        current: dict[str, object] = {}
-        for node in iter_vector_layers(self.doc):
-            current[_node_key(node)] = node
-
-        changed = False
-        for key in list(state.instances):
-            if key not in current:
-                state.instances.pop(key, None)
-                if state.active_id == key:
-                    state.active_id = None
-                if local_state.discard(state.local, key):
-                    self._schedule_local_save()
-                changed = True
-
-        for key, instance in list(state.instances.items()):
-            node = current.get(key)
-            if node is None:
-                continue
-            instance.layer = node
-            try:
-                name = node.name()
-            except Exception:
-                name = instance.name
-            if name != instance.name:
-                instance.name = name
-                if local_state.rename(state.local, key, name):
-                    self._schedule_local_save()
-                changed = True
-
-        used_names = set()
-        for existing in state.instances.values():
-            used_names.add(existing.name)
-            try:
-                used_names.add(existing.layer.name())
-            except Exception:
-                pass
-
-        pending = []
-        for key, layer in current.items():
-            if key in state.instances:
-                continue
-            try:
-                name = layer.name()
-            except Exception:
-                continue
-            base = head_base_name(name)
-            if base is None:
-                source_name = strip_copy_name(name)
-                if not self._head_source_instance(state, source_name or name):
-                    if not self._known_local_head(state, key):
-                        continue
-            pending.append((key, layer, name))
-
-        # Create real heads before their duplicates, so a copied layer can
-        # inherit the source model even when both appear in the same scan.
-        pending.sort(key=lambda item: strip_copy_name(item[2]) is not None)
-
-        for key, layer, name in pending:
-            base = head_base_name(name)
-            source_name = strip_copy_name(name)
-            source = None
-            is_copy = False
-            if base is not None:
-                if name != base or name in used_names:
-                    is_copy = True
-                    source = self._head_source_instance(state, base)
-            else:
-                source = self._head_source_instance(state, source_name or name)
-                if source is not None:
-                    is_copy = True
-                elif not self._known_local_head(state, key):
-                    continue
-
-            target_name = name
-            if is_copy:
-                if source is None:
-                    source = self._head_source_instance(state, source_name or name)
-                target_name = next_name(self.doc, used_names)
-                try:
-                    layer.setName(target_name)
-                except Exception:
-                    pass
-            used_names.add(target_name)
-
-            model = None
-            if source is not None:
-                model = LoomisHead3D()
-                model.apply_preset_dict(source.model.to_preset_dict())
-                model.apply_local_dict(source.model.to_local_dict())
-            instance = HeadInstance.attach(self.doc, target_name, layer, model)
-            instance.name = target_name
-            entry = local_state.lookup(state.local, key, target_name)
-            if entry is not None:
-                instance.model.apply_local_dict(entry)
-                config = entry.get("config")
-                if isinstance(config, dict):
-                    instance.model.apply_config_dict(config)
-                    if "scale" not in entry and "scale" in config:
-                        instance.model.apply_local_dict({"scale": config["scale"]})
-                preset = entry.get("preset")
-                if isinstance(preset, str) and preset:
-                    instance.preset_name = canonical_name(preset)
-                instance.preset_dirty = entry.get("preset_dirty") is True
-            elif model is None:
-                center = instance.bounds_center()
-                if center is not None:
-                    instance.model.set_position_x(center[0] * instance.point_scale_x)
-                    instance.model.set_position_y(center[1] * instance.point_scale_y)
-            instance._refresh_placement_baseline()
-            state.instances[key] = instance
-            changed = True
-
-        active_id = None
-        try:
-            active_node = owning_layer(self.doc.activeNode())
-        except Exception:
-            active_node = None
-        if active_node is not None:
-            key = _node_key(active_node)
-            if key in state.instances:
-                active_id = key
-
-        if active_id != state.active_id:
-            previous = state.instances.get(state.active_id) if state.active_id is not None else None
-            if previous is not None:
-                self._adopt_instance_placement(previous)
-            instance = state.instances.get(active_id) if active_id is not None else None
-            if instance is not None:
-                self._adopt_instance_placement(instance)
-            state.active_id = active_id
-            changed = True
-
-        if changed:
-            self.refresh_instance_header()
-            self.sync_ui_from_model()
+        self.registry.attach(doc)
 
     def _sync_active_reference(self):
-        """Cheap active-layer check; avoid rescanning the layer tree.
-
-        `doc.activeNode()` occasionally stalls for 10-17 ms, so it must not run
-        on every slider tick or redraw frame. Poll it at most every
-        `SYNC_INTERVAL` ms; the 120 ms position timer still catches changes.
-        """
         state = self.active_state()
         if state is None or self.doc is None:
             return
@@ -462,7 +162,7 @@ class LoomisProportionsDocker(DockWidget):
             node = owning_layer(self.doc.activeNode())
         except Exception:
             node = None
-        key = _node_key(node) if node is not None else None
+        key = node_key(node) if node is not None else None
 
         if key is not None and key in state.instances:
             if key != state.active_id:
@@ -470,22 +170,18 @@ class LoomisProportionsDocker(DockWidget):
             return
 
         if state.active_id is not None:
-            self._reconcile_instances()
+            self.registry.reconcile()
 
-    def _add_head(self, state, model=None):
+    def _add_head(self, state):
         self.flush_pending_draw()
-        if model is None:
-            model = _default_model()
-            model.set_position_x(state.doc.width() // 2)
-            model.set_position_y(state.doc.height() // 2)
-        instance = HeadInstance.create(state.doc, model)
-        state.instances[_node_key(instance.layer)] = instance
-        state.active_id = _node_key(instance.layer)
+        instance = HeadInstance.create(state.doc)
+        state.instances[node_key(instance.layer)] = instance
+        state.active_id = node_key(instance.layer)
         self.refresh_instance_header()
         self.sync_ui_from_model()
         instance.reveal(state.doc)
-        self._remember_instance(instance)
-        self._flush_local_state()
+        self.registry.remember(instance)
+        self.registry.flush_local_state()
         self.schedule_update()
 
     def add_head_clicked(self):
@@ -494,28 +190,14 @@ class LoomisProportionsDocker(DockWidget):
             return
         self._add_head(state)
 
-    def _adopt_instance_placement(self, instance):
-        """Absorb moves and scales made while this head was not active."""
-        delta, factor, current, changed = instance.placement_delta()
-        instance.last_shape_states = current
-        if factor is not None:
-            instance.apply_scale_factor(factor)
-            instance.needs_normalize = True
-            self._remember_instance(instance)
-        elif delta is not None:
-            instance.model.set_position_x(instance.model.position_x + delta[0])
-            instance.model.set_position_y(instance.model.position_y + delta[1])
-            instance._refresh_placement_baseline()
-            self._remember_instance(instance)
-
     def _activate_instance(self, key):
         state = self.active_state()
         if state is None or key not in state.instances or key == state.active_id:
             return
         previous = state.active()
         if previous is not None:
-            self._adopt_instance_placement(previous)
-        self._adopt_instance_placement(state.instances[key])
+            self.registry.adopt(previous)
+        self.registry.adopt(state.instances[key])
         state.active_id = key
         self.refresh_instance_header()
         self.sync_ui_from_model()
@@ -536,42 +218,15 @@ class LoomisProportionsDocker(DockWidget):
         self._set_editing_enabled(has_instance)
 
     def _apply_limit_ranges(self):
-        """Build slider ranges from limits.py so the .ui cannot drift."""
-        self.ui.sideCutSlider.setRange(
-            round(limits.SIDE_CUT.minimum * 100), round(limits.SIDE_CUT.maximum * 100)
-        )
-        self.ui.faceAgeSlider.setRange(
-            round(limits.FACE_AGE.minimum * 100), round(limits.FACE_AGE.maximum * 100)
-        )
-        self.ui.chinWidthSlider.setRange(
-            round(limits.CHIN_WIDTH.minimum * 100), round(limits.CHIN_WIDTH.maximum * 100)
-        )
-        self.ui.frontStrokeSlider.setRange(
-            round(limits.FRONT_LINE_STROKE.minimum),
-            round(limits.FRONT_LINE_STROKE.maximum),
-        )
-        self.ui.backStrokeSlider.setRange(
-            round(limits.BACK_LINE_STROKE.minimum),
-            round(limits.BACK_LINE_STROKE.maximum),
-        )
+        for spec in SLIDERS:
+            getattr(self.ui, spec.widget).setRange(
+                round(spec.limit.minimum / spec.factor),
+                round(spec.limit.maximum / spec.factor),
+            )
 
     def _set_editing_enabled(self, enabled):
-        widgets = [
-            self.ui.sideCutSlider,
-            self.ui.faceAgeSlider,
-            self.ui.chinWidthSlider,
-            self.ui.frontStrokeSlider,
-            self.ui.backStrokeSlider,
-            self.ui.showFace,
-            self.ui.showArrow,
-            self.ui.showSilhouette,
-            self.ui.showSideRims,
-            self.ui.showSideCross,
-            self.ui.strokeColorButton,
-            self.ui.trackballHost,
-        ]
-        for widget in widgets:
-            widget.setEnabled(enabled)
+        for name in EDITING_WIDGETS:
+            getattr(self.ui, name).setEnabled(enabled)
         self._update_preset_buttons()
 
     def with_schedule_update(self, fn, preset_change=True):
@@ -589,29 +244,7 @@ class LoomisProportionsDocker(DockWidget):
             return
         instance.preset_dirty = True
         self._sync_preset_selection()
-        self._remember_instance(instance)
-
-    def _sync_preset_selection(self):
-        combo = self.ui.presetCombo
-        instance = self.active_instance()
-        name = instance.preset_name if instance is not None else None
-        builtins = builtin_names()
-        combo.blockSignals(True)
-        for index in range(combo.count()):
-            item_name = combo.itemData(index)
-            combo.setItemText(index, preset_label(item_name, item_name in builtins))
-        index = combo.findData(name) if name else -1
-        if index < 0:
-            default_names = builtin_names()
-            index = combo.findData(default_names[0]) if default_names else -1
-        if index < 0 and combo.count():
-            index = 0
-        combo.setCurrentIndex(index)
-        if index >= 0 and instance is not None and instance.preset_dirty:
-            item_name = combo.itemData(index)
-            combo.setItemText(index, preset_label(item_name, item_name in builtins, True))
-        combo.blockSignals(False)
-        self._update_preset_buttons()
+        self.registry.remember(instance)
 
     def _sync_color_swatch(self):
         self.ui.strokeColorSwatch.setStyleSheet(
@@ -668,17 +301,6 @@ class LoomisProportionsDocker(DockWidget):
 
         self._apply_limit_ranges()
 
-        self.loomis_head.set_sidecut(self.ui.sideCutSlider.value() * 0.01)
-        self.loomis_head.set_face_age(self.ui.faceAgeSlider.value() * 0.01)
-        self.loomis_head.set_chin_width(self.ui.chinWidthSlider.value() * 0.01)
-        self.loomis_head.set_front_line_stroke(self.ui.frontStrokeSlider.value())
-        self.loomis_head.set_back_line_stroke(self.ui.backStrokeSlider.value())
-        self.loomis_head.set_show_face(self.ui.showFace.isChecked())
-        self.loomis_head.set_arrow(self.ui.showArrow.isChecked())
-        self.loomis_head.set_silhouette(self.ui.showSilhouette.isChecked())
-        self.loomis_head.set_side_rims(self.ui.showSideRims.isChecked())
-        self.loomis_head.set_side_cross(self.ui.showSideCross.isChecked())
-
         host = self.ui.findChild(QWidget, "trackballHost")
         self.trackball = TrackballWidget(host)
         lay = QVBoxLayout(host)
@@ -693,43 +315,16 @@ class LoomisProportionsDocker(DockWidget):
         self.trackball.drag_started.connect(self._begin_interaction)
         self.trackball.drag_released.connect(self._end_interaction)
 
-        self.ui.sideCutSlider.valueChanged.connect(
-            lambda v: self.with_schedule_update(lambda: self.loomis_head.set_sidecut(v * 0.01))
-        )
-        self.ui.faceAgeSlider.valueChanged.connect(
-            lambda v: self.with_schedule_update(lambda: self.loomis_head.set_face_age(v * 0.01))
-        )
-        self.ui.chinWidthSlider.valueChanged.connect(
-            lambda v: self.with_schedule_update(lambda: self.loomis_head.set_chin_width(v * 0.01))
-        )
-        self.ui.showFace.toggled.connect(
-            lambda v: self.with_schedule_update(lambda: self.loomis_head.set_show_face(v))
-        )
-        self.ui.frontStrokeSlider.valueChanged.connect(
-            lambda v: self.with_schedule_update(lambda: self.loomis_head.set_front_line_stroke(v))
-        )
-        self.ui.backStrokeSlider.valueChanged.connect(
-            lambda v: self.with_schedule_update(lambda: self.loomis_head.set_back_line_stroke(v))
-        )
+        for spec in SLIDERS:
+            slider = getattr(self.ui, spec.widget)
+            slider.valueChanged.connect(self._make_slider_handler(spec))
+            slider.valueChanged.connect(self._update_value_labels)
+            slider.sliderPressed.connect(self._begin_interaction)
+            slider.sliderReleased.connect(self._end_interaction)
 
-        self.ui.sideCutSlider.valueChanged.connect(self._update_value_labels)
-        self.ui.faceAgeSlider.valueChanged.connect(self._update_value_labels)
-        self.ui.chinWidthSlider.valueChanged.connect(self._update_value_labels)
-        self.ui.frontStrokeSlider.valueChanged.connect(self._update_value_labels)
-        self.ui.backStrokeSlider.valueChanged.connect(self._update_value_labels)
+        for spec in TOGGLES:
+            getattr(self.ui, spec.widget).toggled.connect(self._make_toggle_handler(spec))
 
-        self.ui.showArrow.toggled.connect(
-            lambda v: self.with_schedule_update(lambda: self.loomis_head.set_arrow(v))
-        )
-        self.ui.showSilhouette.toggled.connect(
-            lambda v: self.with_schedule_update(lambda: self.loomis_head.set_silhouette(v))
-        )
-        self.ui.showSideRims.toggled.connect(
-            lambda v: self.with_schedule_update(lambda: self.loomis_head.set_side_rims(v))
-        )
-        self.ui.showSideCross.toggled.connect(
-            lambda v: self.with_schedule_update(lambda: self.loomis_head.set_side_cross(v))
-        )
         self.ui.strokeColorButton.clicked.connect(self.pick_stroke_color)
         self.ui.transformGuideButton.clicked.connect(self.show_transform_guide)
         self.trackball.reset_button.clicked.connect(self.reset_view)
@@ -741,16 +336,6 @@ class LoomisProportionsDocker(DockWidget):
         self.ui.deletePresetButton.clicked.connect(self.delete_preset)
         self.ui.presetCombo.currentIndexChanged.connect(self._update_preset_buttons)
 
-        for slider in (
-            self.ui.sideCutSlider,
-            self.ui.faceAgeSlider,
-            self.ui.chinWidthSlider,
-            self.ui.frontStrokeSlider,
-            self.ui.backStrokeSlider,
-        ):
-            slider.sliderPressed.connect(self._begin_interaction)
-            slider.sliderReleased.connect(self._end_interaction)
-
         self.ui.updateIntervalSpin.valueChanged.connect(self._perf_changed)
         self.ui.liveUpdateCheck.toggled.connect(self._perf_changed)
         self.ui.reduceLiveCheck.toggled.connect(self._perf_changed)
@@ -760,14 +345,28 @@ class LoomisProportionsDocker(DockWidget):
         self._sync_color_swatch()
         self._update_value_labels()
 
-    def _update_value_labels(self, *_):
-        self.ui.sideCutValue.setText(str(self.ui.sideCutSlider.value()))
-        self.ui.faceAgeValue.setText(str(self.ui.faceAgeSlider.value()))
-        self.ui.chinWidthValue.setText(str(self.ui.chinWidthSlider.value()))
-        self.ui.frontStrokeValue.setText(str(self.ui.frontStrokeSlider.value()))
-        self.ui.backStrokeValue.setText(str(self.ui.backStrokeSlider.value()))
+    def _make_slider_handler(self, spec):
+        def handle(value):
+            self.with_schedule_update(
+                lambda: getattr(self.loomis_head, spec.setter)(value * spec.factor)
+            )
 
-    # --- performance ----------------------------------------------------
+        return handle
+
+    def _make_toggle_handler(self, spec):
+        def handle(checked):
+            self.with_schedule_update(
+                lambda: getattr(self.loomis_head, spec.setter)(checked)
+            )
+
+        return handle
+
+    def _update_value_labels(self, *_):
+        for spec in SLIDERS:
+            getattr(self.ui, spec.label).setText(
+                str(getattr(self.ui, spec.widget).value())
+            )
+
 
     def _load_perf_settings(self):
         values = self.perf_store.load()
@@ -804,6 +403,8 @@ class LoomisProportionsDocker(DockWidget):
         self.ui.liveSamplesSpin.setEnabled(self.ui.reduceLiveCheck.isChecked())
 
     def _begin_interaction(self, *_):
+        if not self._interacting:
+            self.sync_manual_position()
         self._interacting = True
 
     def _end_interaction(self, *_):
@@ -811,8 +412,6 @@ class LoomisProportionsDocker(DockWidget):
         self.draw_timer.stop()
         self.update_scheduled = False
         self.sync_manual_position()
-        self.draw_timer.stop()
-        self.update_scheduled = False
         self.draw_lines_with_vectors(samples=LIVE_SAMPLES)
 
     def _redraw_samples(self):
@@ -820,28 +419,40 @@ class LoomisProportionsDocker(DockWidget):
             return self.ui.liveSamplesSpin.value()
         return LIVE_SAMPLES
 
-    # --- presets --------------------------------------------------------
 
-    def refresh_preset_combo(self, selected=None):
+    def _sync_preset_selection(self, selected=None, rebuild=False):
         combo = self.ui.presetCombo
-        current = selected if selected is not None else combo.currentData()
-        combo.blockSignals(True)
-        combo.clear()
-        for name, _model, is_builtin in self.preset_store.all_presets():
-            combo.addItem(preset_label(name, is_builtin), name)
-        if current is not None:
-            index = combo.findData(current)
-            if index >= 0:
-                combo.setCurrentIndex(index)
-            elif combo.count():
-                combo.setCurrentIndex(0)
+        instance = self.active_instance()
+        if selected is not None:
+            name = selected
+        elif instance is not None and instance.preset_name:
+            name = instance.preset_name
+        elif rebuild:
+            name = combo.currentData()
         else:
+            name = None
+
+        combo.blockSignals(True)
+        if rebuild:
+            combo.clear()
+            for preset_name, _model, is_builtin in self.preset_store.all_presets():
+                combo.addItem(preset_label(preset_name, is_builtin), preset_name)
+
+        builtins = builtin_names()
+        for index in range(combo.count()):
+            item_name = combo.itemData(index)
+            combo.setItemText(index, preset_label(item_name, item_name in builtins))
+
+        index = combo.findData(name) if name else -1
+        if index < 0:
             default_names = builtin_names()
             index = combo.findData(default_names[0]) if default_names else -1
-            if index >= 0:
-                combo.setCurrentIndex(index)
-            elif combo.count():
-                combo.setCurrentIndex(0)
+        if index < 0 and combo.count():
+            index = 0
+        combo.setCurrentIndex(index)
+        if index >= 0 and instance is not None and instance.preset_dirty:
+            item_name = combo.itemData(index)
+            combo.setItemText(index, preset_label(item_name, item_name in builtins, True))
         combo.blockSignals(False)
         self._update_preset_buttons()
 
@@ -884,7 +495,6 @@ class LoomisProportionsDocker(DockWidget):
         instance.preset_name = name
         instance.preset_dirty = False
         self.sync_ui_from_model()
-        self._sync_preset_selection()
         self.schedule_update()
 
     def save_preset(self):
@@ -921,9 +531,8 @@ class LoomisProportionsDocker(DockWidget):
             return
         instance.preset_name = saved
         instance.preset_dirty = False
-        self._remember_instance(instance)
-        self.refresh_preset_combo(selected=saved)
-        self._sync_preset_selection()
+        self.registry.remember(instance)
+        self._sync_preset_selection(selected=saved, rebuild=True)
 
     def delete_preset(self):
         if self.active_instance() is None:
@@ -954,37 +563,22 @@ class LoomisProportionsDocker(DockWidget):
                 if instance.preset_name == name:
                     instance.preset_name = None
                     instance.preset_dirty = False
-                    self._remember_instance(instance)
-        self.refresh_preset_combo()
-        self._sync_preset_selection()
+                    self.registry.remember(instance)
+        self._sync_preset_selection(rebuild=True)
 
     def sync_ui_from_model(self):
         model = self.loomis_head
-        widgets = [
-            self.ui.sideCutSlider,
-            self.ui.faceAgeSlider,
-            self.ui.chinWidthSlider,
-            self.ui.frontStrokeSlider,
-            self.ui.backStrokeSlider,
-            self.ui.showFace,
-            self.ui.showArrow,
-            self.ui.showSilhouette,
-            self.ui.showSideRims,
-            self.ui.showSideCross,
-        ]
+        widgets = [getattr(self.ui, spec.widget) for spec in SLIDERS]
+        widgets += [getattr(self.ui, spec.widget) for spec in TOGGLES]
         for widget in widgets:
             widget.blockSignals(True)
 
-        self.ui.sideCutSlider.setValue(round(model.side_cut * 100))
-        self.ui.faceAgeSlider.setValue(round(model.face_age * 100))
-        self.ui.chinWidthSlider.setValue(round(model.chin_width * 100))
-        self.ui.frontStrokeSlider.setValue(round(model.front_line_stroke))
-        self.ui.backStrokeSlider.setValue(round(model.back_line_stroke))
-        self.ui.showFace.setChecked(model.show_face)
-        self.ui.showArrow.setChecked(model.show_arrow)
-        self.ui.showSilhouette.setChecked(model.show_silhouette)
-        self.ui.showSideRims.setChecked(model.show_side_rims)
-        self.ui.showSideCross.setChecked(model.show_side_cross)
+        for spec in SLIDERS:
+            getattr(self.ui, spec.widget).setValue(
+                round(getattr(model, spec.attr) / spec.factor)
+            )
+        for spec in TOGGLES:
+            getattr(self.ui, spec.widget).setChecked(getattr(model, spec.attr))
 
         for widget in widgets:
             widget.blockSignals(False)
@@ -996,7 +590,11 @@ class LoomisProportionsDocker(DockWidget):
         self.trackball.blockSignals(False)
         self._sync_preset_selection()
 
-    # --- drawing --------------------------------------------------------
+    def _sync_trackball_rotation(self):
+        self.trackball.blockSignals(True)
+        self.trackball.set_quaternion(self.loomis_head.q)
+        self.trackball.blockSignals(False)
+
 
     def flush_pending_draw(self, samples=LIVE_SAMPLES):
         if self.update_scheduled:
@@ -1010,15 +608,13 @@ class LoomisProportionsDocker(DockWidget):
         if instance is None:
             self.update_scheduled = False
             return
-        # Absorb any pending Select Shapes move before a redraw would snap the
-        # layer back to the last known model position.
         if self.doc is not None and not self._drawing and not self.update_scheduled:
             self.sync_manual_position()
         live_update = self.ui.liveUpdateCheck.isChecked()
         interval = self.ui.updateIntervalSpin.value() if live_update else 0
         if interval > 0 and has_transformed_placement(instance):
             interval = max(interval, TRANSFORMED_REDRAW_DEBOUNCE)
-        self._remember_instance(instance)
+        self.registry.remember(instance)
         if interval == 0:
             if self._interacting:
                 self.update_scheduled = True
@@ -1040,20 +636,15 @@ class LoomisProportionsDocker(DockWidget):
             self.draw_lines_with_vectors()
 
     def sync_manual_position(self):
-        """Mirror manual shape moves and scale gestures into the model."""
         if self.doc is not None and not self._drawing:
             self._sync_active_reference()
         instance = self.active_instance()
-        if (
-            not self.doc
-            or instance is None
-            or self.update_scheduled
-            or self._drawing
-        ):
+        if not self.doc or instance is None or self.update_scheduled or self._drawing:
             return
 
-        delta, factor, current, changed = instance.placement_delta()
-        instance.last_shape_states = current
+        _moved, changed = self.registry.adopt(instance)
+        if not self._interacting and instance.take_rotation_applied():
+            self._sync_trackball_rotation()
         if not changed:
             if instance.needs_normalize:
                 instance.stable_polls += 1
@@ -1064,19 +655,6 @@ class LoomisProportionsDocker(DockWidget):
             return
 
         instance.stable_polls = 0
-        if factor is not None:
-            instance.apply_scale_factor(factor)
-            instance.needs_normalize = True
-            self._remember_instance(instance)
-            return
-
-        if delta is None:
-            return
-
-        instance.model.set_position_x(instance.model.position_x + delta[0])
-        instance.model.set_position_y(instance.model.position_y + delta[1])
-        instance._refresh_placement_baseline()
-        self._remember_instance(instance)
 
     def _poll_active_layer(self):
         if self.doc is not None and not self._drawing:
@@ -1117,7 +695,6 @@ class LoomisProportionsDocker(DockWidget):
                 )
             )
 
-    # --- actions --------------------------------------------------------
 
     def show_transform_guide(self):
         QMessageBox.information(
@@ -1133,7 +710,6 @@ class LoomisProportionsDocker(DockWidget):
         )
 
     def reset_view(self):
-        # Reset model rotation and the mask rotation; leave position and scale.
         instance = self.active_instance()
         if instance is None:
             return
@@ -1157,5 +733,4 @@ class LoomisHeadPlugin(Extension):
         )
 
     def createActions(self, window):
-        # The plugin is exposed as a docker from Settings -> Dockers.
         pass

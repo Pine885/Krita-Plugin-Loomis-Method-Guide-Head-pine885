@@ -23,10 +23,6 @@ def q_normalize(q: Quaternion) -> Quaternion:
     return q.normalized()
 
 
-def q_mul(b: Quaternion, a: Quaternion) -> Quaternion:
-    return b * a
-
-
 def q_axis_angle(axis_xyz: Vector3 | Sequence[float], angle_rad: float) -> Quaternion:
     if isinstance(axis_xyz, Vector3):
         ax = normalize(axis_xyz)
@@ -52,18 +48,12 @@ def mat3_mul_vec(m: Mat3, v: Vector3) -> Vector3:
 
 
 def q_to_yaw_pitch_roll(q: Quaternion) -> tuple[float, float, float]:
-    """Split a normalized orientation into the trackball's turntable angles.
-
-    The widget builds ``q = roll * yaw * pitch``. The forward axis is invariant
-    under the final roll, so yaw and pitch come from it and roll is the signed
-    angle between the unrolled and final right vectors about that axis.
-    """
     q = q_normalize(q)
     forward = mat3_mul_vec(q_to_mat3(q), Vector3(0.0, 0.0, 1.0))
     yaw = math.atan2(forward.x, forward.z)
     pitch = -math.asin(max(-1.0, min(1.0, forward.y)))
 
-    turn = q_mul(q_axis_angle([0.0, 1.0, 0.0], yaw), q_axis_angle([1.0, 0.0, 0.0], pitch))
+    turn = q_axis_angle([0.0, 1.0, 0.0], yaw) * q_axis_angle([1.0, 0.0, 0.0], pitch)
     right_turn = mat3_mul_vec(q_to_mat3(turn), Vector3(1.0, 0.0, 0.0))
     right_final = mat3_mul_vec(q_to_mat3(q), Vector3(1.0, 0.0, 0.0))
 

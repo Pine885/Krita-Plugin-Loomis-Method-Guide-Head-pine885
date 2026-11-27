@@ -1,22 +1,10 @@
-"""Built-in and user head presets.
-
-User presets store reusable visual configuration only. Per-document position
-and direction live in ``local_state.py``. Built-in orientation presets are the
-exception: they intentionally carry a direction.
-
-This module deliberately avoids importing Krita or PyQt so it can be tested
-with plain Python. The docker supplies the application data directory.
-"""
-
 import copy
-import json
 import os
 import shutil
-import tempfile
 
-from . import diag
+from . import diag, jsonio
 
-from .linalg import q_axis_angle, q_mul
+from .linalg import q_axis_angle
 
 SCHEMA_VERSION = 1
 
@@ -24,21 +12,19 @@ BUILTIN_ORDER = (
     "Default",
 )
 
-# Documents written before the built-in rename still store "Front".
 LEGACY_BUILTIN_NAMES = {
     "Front": "Default",
 }
 
 
 def canonical_name(name: str) -> str:
-    """Return the current built-in name for a legacy preset name."""
     return LEGACY_BUILTIN_NAMES.get(name, name)
 
 
 def _quaternion(yaw_deg: float, pitch_deg: float = 0.0):
     q_yaw = q_axis_angle([0.0, 1.0, 0.0], yaw_deg * 3.141592653589793 / 180.0)
     q_pitch = q_axis_angle([1.0, 0.0, 0.0], pitch_deg * 3.141592653589793 / 180.0)
-    return q_mul(q_yaw, q_pitch)
+    return q_yaw * q_pitch
 
 
 def _builtin_model(yaw: float = 0.0, pitch: float = 0.0) -> dict:
@@ -59,7 +45,6 @@ def builtin_names() -> list[str]:
 
 
 def preset_label(name: str, is_builtin: bool, dirty: bool = False) -> str:
-    """Return the combo-box label for a preset, including the dirty marker."""
     label = str(name)
     if dirty:
         label += " *"
@@ -69,7 +54,6 @@ def preset_label(name: str, is_builtin: bool, dirty: bool = False) -> str:
 def load_button_label(
     preset_name: str | None, selected_name: str | None, dirty: bool = False
 ) -> str:
-    """Return ``Reload`` when reapplying the preset would discard edits."""
     if preset_name and preset_name == selected_name and dirty:
         return "Reload"
     return "Load"
@@ -87,14 +71,12 @@ def clean_name(name: str) -> str:
 
 
 class PresetStore:
-    """JSON-backed user preset storage with atomic writes."""
 
     def __init__(self, directory: str) -> None:
         self.directory = directory
         self.path = os.path.join(directory, "presets.json")
 
     def _backup_corrupt(self) -> None:
-        """Keep the damaged file so the next save cannot silently erase it."""
         try:
             if os.path.exists(self.path):
                 shutil.copyfile(self.path, self.path + ".bak")
@@ -102,12 +84,7 @@ class PresetStore:
             diag.warn("could not back up corrupt presets file: %s" % exc)
 
     def _load_file(self) -> dict:
-        try:
-            with open(self.path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-        except (OSError, ValueError):
-            self._backup_corrupt()
-            return {}
+        data = jsonio.read_json(self.path)
         if not isinstance(data, dict):
             self._backup_corrupt()
             return {}
@@ -122,17 +99,9 @@ class PresetStore:
         }
 
     def _write_file(self, presets: dict) -> None:
-        os.makedirs(self.directory, exist_ok=True)
-        payload = {"version": SCHEMA_VERSION, "presets": presets}
-        fd, temp_path = tempfile.mkstemp(prefix=".presets-", suffix=".json", dir=self.directory)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2, sort_keys=True)
-                handle.write("\n")
-            os.replace(temp_path, self.path)
-        finally:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
+        jsonio.write_json(
+            self.path, {"version": SCHEMA_VERSION, "presets": presets}
+        )
 
     def user_presets(self) -> dict[str, dict]:
         return self._load_file()
@@ -157,7 +126,6 @@ class PresetStore:
         return True
 
     def all_presets(self) -> list[tuple[str, dict, bool]]:
-        """Return (name, model, is_builtin), built-ins first."""
         result: list[tuple[str, dict, bool]] = [
             (name, copy.deepcopy(BUILTIN_PRESETS[name]), True) for name in BUILTIN_ORDER
         ]
@@ -169,7 +137,6 @@ class PresetStore:
         return result
 
     def get(self, name: str) -> dict | None:
-        """Return one preset by name, or None when it no longer exists."""
         if not name:
             return None
         if name in BUILTIN_PRESETS:

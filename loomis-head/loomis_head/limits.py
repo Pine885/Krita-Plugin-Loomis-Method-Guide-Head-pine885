@@ -1,9 +1,3 @@
-"""Single source of truth for model limits and defaults.
-
-The generator clamps to these values, the docker builds its slider ranges from
-them, and the built-in Default preset is derived from the generator defaults.
-"""
-
 from typing import NamedTuple
 
 

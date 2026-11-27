@@ -48,15 +48,28 @@ def _valid_color(value) -> bool:
     )
 
 
+def _bezier(p0, c1, c2, p3, steps: int = 64) -> Poly3:
+    curve: Poly3 = []
+    for i in range(steps + 1):
+        t = i / float(steps)
+        u = 1.0 - t
+        curve.append(
+            Vector3(
+                u * u * u * p0.x + 3 * u * u * t * c1.x + 3 * u * t * t * c2.x + t * t * t * p3.x,
+                u * u * u * p0.y + 3 * u * u * t * c1.y + 3 * u * t * t * c2.y + t * t * t * p3.y,
+                u * u * u * p0.z + 3 * u * u * t * c1.z + 3 * u * t * t * c2.z + t * t * t * p3.z,
+            )
+        )
+    return curve
+
+
 class LoomisHead3D:
     def __init__(self) -> None:
         self.radius: float = limits.RADIUS.default
         self.scale: float = limits.SCALE.default
-        # Absolute document-pixel coordinates for the head's center.
         self.position_x: float = 0.0
         self.position_y: float = 0.0
         self.side_cut: float = limits.SIDE_CUT.default
-        # These controls affect only the added jaw/chin/cheek guides.
         self.face_age: float = limits.FACE_AGE.default
         self.chin_width: float = limits.CHIN_WIDTH.default
         self.show_face: bool = True
@@ -130,10 +143,8 @@ class LoomisHead3D:
     def set_stroke_color(self, color: str) -> None:
         self.stroke_color = color
 
-    # --- preset serialization ------------------------------------------
 
     def to_preset_dict(self) -> dict:
-        """Return reusable head settings. Position, direction and size are excluded."""
         return {
             "radius": self.radius,
             "side_cut": self.side_cut,
@@ -153,13 +164,11 @@ class LoomisHead3D:
         }
 
     def to_config_dict(self) -> dict:
-        """Return only reusable visual settings, without position, direction or size."""
         data = self.to_preset_dict()
         data.pop("quaternion", None)
         return data
 
     def apply_config_dict(self, data: dict) -> None:
-        """Apply visual settings only, ignoring placement, direction and size."""
         if not isinstance(data, dict):
             return
         config = dict(data)
@@ -171,7 +180,6 @@ class LoomisHead3D:
         self.apply_preset_dict(config)
 
     def to_local_dict(self) -> dict:
-        """Return the per-document placement for this head instance."""
         return {
             "position": [self.position_x, self.position_y],
             "quaternion": [self.q.w, self.q.x, self.q.y, self.q.z],
@@ -179,7 +187,6 @@ class LoomisHead3D:
         }
 
     def apply_local_dict(self, data: dict) -> None:
-        """Apply per-document position, direction and size, ignoring invalid fields."""
         if not isinstance(data, dict):
             return
 
@@ -217,7 +224,6 @@ class LoomisHead3D:
                 self.set_quaternion(candidate)
 
     def apply_preset_dict(self, data: dict) -> None:
-        """Apply preset data, ignoring invalid or unknown fields."""
         if not isinstance(data, dict):
             return
 
@@ -370,12 +376,10 @@ class LoomisHead3D:
         self, side: float, d_geom: float, rim_r: float
     ) -> tuple[Vector3, Vector3, Vector3]:
         r = self.radius
-        # Child/adult slider shortens the added lower face toward the child end.
-        # At 100 (adult), the original v0.2.4 proportions are unchanged.
         age = self.face_age
         jaw_length = 0.8 * (1.22 * r - rim_r) * (0.65 + 0.35 * age)
         jaw_angle = math.radians(10.0)
-        front_extension_length = r  # keep the front reach tied to the original sphere
+        front_extension_length = r
         front_down_angle = math.radians(12.0 + 8.0 * age)
         front_inward_angle = math.radians(15.0)
 
@@ -416,8 +420,8 @@ class LoomisHead3D:
         if self.show_silhouette:
             curves.append(self._circle_on_plane(n_sil_head, [0.0, 0.0, 0.0], r, samples))
 
-        curves.append(self._circle_on_plane(nx, [0.0, 0.0, 0.0], r, samples))  # centerline
-        curves.append(self._circle_on_plane(ny, [0.0, 0.0, 0.0], r, samples))  # equator
+        curves.append(self._circle_on_plane(nx, [0.0, 0.0, 0.0], r, samples))
+        curves.append(self._circle_on_plane(ny, [0.0, 0.0, 0.0], r, samples))
 
         rims_plus: list[Poly3] = []
         rims_minus: list[Poly3] = []
@@ -443,18 +447,11 @@ class LoomisHead3D:
                 ]
             )
 
-        # Jaw guide: merge the downward jaw segment and front extension into
-        # one smooth cubic Bezier curve. The curve starts at the lower side-cross/
-        # rim intersection, follows the 10-degree inward/downward direction, then
-        # smoothly turns toward the front (+Z), with the extension's 20-degree
-        # downward slope and 15-degree inward direction. Keep the two sides separate.
         jaw_curves: list[Poly3] = []
         jaw_front_endpoints: dict[float, Vector3] = {}
         for side in (-1.0, 1.0):
             p0, p1, p2 = self._jaw_points(side, d_geom, rim_r)
 
-            # Cubic Bezier control points keep the curve tangent to the original
-            # first and second segment directions, removing the sharp corner at p1.
             c1 = Vector3(
                 p0.x + (p1.x - p0.x) * 0.9,
                 p0.y + (p1.y - p0.y) * 0.9,
@@ -465,23 +462,11 @@ class LoomisHead3D:
                 p2.y - (p2.y - p1.y) * 0.9,
                 p2.z - (p2.z - p1.z) * 0.9,
             )
-            curve: Poly3 = []
-            for i in range(65):
-                t = i / 64.0
-                u = 1.0 - t
-                curve.append(Vector3(
-                    u*u*u*p0.x + 3*u*u*t*c1.x + 3*u*t*t*c2.x + t*t*t*p2.x,
-                    u*u*u*p0.y + 3*u*u*t*c1.y + 3*u*t*t*c2.y + t*t*t*p2.y,
-                    u*u*u*p0.z + 3*u*u*t*c1.z + 3*u*t*t*c2.z + t*t*t*p2.z,
-                ))
-            jaw_curves.append(curve)
+            jaw_curves.append(_bezier(p0, c1, c2, p2))
             jaw_front_endpoints[side] = p2
 
-        # Connect the mirrored jaw curves across the front of the chin.
         jaw_front_connector = [jaw_front_endpoints[-1.0], jaw_front_endpoints[1.0]]
 
-        # Center front guide: connect the midpoint of the chin line to the
-        # forward pole of the sphere, staying on the face's center plane.
         chin_midpoint = Vector3(
             (jaw_front_endpoints[-1.0].x + jaw_front_endpoints[1.0].x) * 0.5,
             (jaw_front_endpoints[-1.0].y + jaw_front_endpoints[1.0].y) * 0.5,
@@ -490,17 +475,11 @@ class LoomisHead3D:
         sphere_front_edge = Vector3(0.0, 0.0, r)
         front_center_guide = [sphere_front_edge, chin_midpoint]
 
-        # Cheekbone guides: begin directly on the side rim, then follow one
-        # broad downward/inward arc to the jaw/chin junction.
         cheekbone_curves: list[Poly3] = []
         for side in (-1.0, 1.0):
-            # Start exactly where the forward end of the depth-wise side-cross
-            # guide meets the side-rim circle.
             cheek_rim_touch = Vector3(side * d_geom, 0.0, rim_r)
             cheek_end = jaw_front_endpoints[side]
 
-            # One continuous arc from the rim directly to the chin junction.
-            cheek_curve: Poly3 = [cheek_rim_touch]
             dx = cheek_end.x - cheek_rim_touch.x
             dy = cheek_end.y - cheek_rim_touch.y
             dz = cheek_end.z - cheek_rim_touch.z
@@ -514,15 +493,7 @@ class LoomisHead3D:
                 cheek_rim_touch.y + 0.78 * dy,
                 cheek_rim_touch.z + 0.78 * dz,
             )
-            for i in range(1, 65):
-                t = i / 64.0
-                u = 1.0 - t
-                cheek_curve.append(Vector3(
-                    u*u*u*cheek_rim_touch.x + 3*u*u*t*cheek_c1.x + 3*u*t*t*cheek_c2.x + t*t*t*cheek_end.x,
-                    u*u*u*cheek_rim_touch.y + 3*u*u*t*cheek_c1.y + 3*u*t*t*cheek_c2.y + t*t*t*cheek_end.y,
-                    u*u*u*cheek_rim_touch.z + 3*u*u*t*cheek_c1.z + 3*u*t*t*cheek_c2.z + t*t*t*cheek_end.z,
-                ))
-            cheekbone_curves.append(cheek_curve)
+            cheekbone_curves.append(_bezier(cheek_rim_touch, cheek_c1, cheek_c2, cheek_end))
 
         front_paths: list[str] = []
         back_paths: list[str] = []
@@ -566,8 +537,6 @@ class LoomisHead3D:
                 )
 
         if self.show_arrow and arrow_d:
-            # Keep the arrow in the back-path shape: it uses the back-stroke
-            # style and cannot be selected or moved separately from the guide.
             back_paths.append(arrow_d)
 
         dash_attr = f' stroke-dasharray="{dash_back}"' if dash_back else ""
